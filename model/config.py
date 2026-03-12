@@ -38,7 +38,7 @@ class SpongeBobConfig(PretrainedConfig):
             
             # 激活函数和正则化
             hidden_act: str = 'silu', #swish
-            dropout: float = 0.0,
+            dropout: float = dir model/0.0,
             rms_norm_eps: float = 1e-05,
             
             # 特殊 token

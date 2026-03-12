@@ -91,8 +91,8 @@ def train_epoch(epoch, loader, iters, start_step=0, swanlab=None, total_steps=No
         # 7.Benchmark 评测 评测效果：验证模型性能
         if args.eval_bench == 1 and tokenizer is not None and global_step % args.eval_interval == 0:
             model.eval()
-            c3_path = 'https://huggingface.co/datasets/clue/clue/viewer/c3'
-            xcopa_path = 'https://huggingface.co/datasets/cambridgeltl/xcopa/viewer/zh'
+            c3_path = 'D:\spongebobpro\benchmark\clue_c3_eval_500.jsonl'
+            xcopa_path = 'D:\spongebobpro\benchmark\xcopa_zh_merged.jsonl'
             eval_results = run_benchmark(model, tokenizer, c3_path, xcopa_path)
             if swanlab_run:
                 swanlab_run.log(eval_results, step=global_step)
@@ -213,8 +213,8 @@ if __name__ == "__main__":
     if args.eval_bench == 1 and tokenizer is not None and start_epoch == 0 and start_step == 0:
         Logger('Running initial benchmark evaluation (step 0)...')
         model.eval()
-        c3_path = ''
-        xcopa_path = ''
+        c3_path = 'D:\spongebobpro\benchmark\clue_c3_eval_500.jsonl'
+        xcopa_path = 'D:\spongebobpro\benchmark\xcopa_zh_merged.jsonl'
         #返回分数
         eval_results = run_benchmark(model, tokenizer, c3_path, xcopa_path)
         if swanlab_run:

@@ -327,7 +327,7 @@ class SpongeBobModel(nn.Module):
         
         Returns:
             hidden_states: 最后一层的隐藏状态 (batch, seq_len, hidden_size)
-            presents: 新的 KV cache 列表
+            presents: 新的 KV ·cache 列表
         """
         batch_size, seq_length = input_ids.shape
 
