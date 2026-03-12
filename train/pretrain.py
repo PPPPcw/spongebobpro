@@ -48,8 +48,8 @@ def train_epoch(epoch, loader, iters, start_step=0, swanlab=None, total_steps=No
 
         scaler.scale(loss).backward()  # 放大loss，再反向传播算梯度（避免下溢）
     #4.反向传播 + 参数更新：核心训练逻辑
-        # 梯度累积步数到了，才更新参数
-        #梯度更新时：先把梯度缩回去，再更新参数
+    # 梯度累积步数到了，才更新参数
+    #梯度更新时：先把梯度缩回去，再更新参数
         if (step + 1) % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)  # 把放大的梯度缩回原大小
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)  # 梯度裁剪：防止梯度爆炸
@@ -91,8 +91,8 @@ def train_epoch(epoch, loader, iters, start_step=0, swanlab=None, total_steps=No
         # 7.Benchmark 评测 评测效果：验证模型性能
         if args.eval_bench == 1 and tokenizer is not None and global_step % args.eval_interval == 0:
             model.eval()
-            c3_path = '测试集地址'
-            xcopa_path = '测试集地址'
+            c3_path = 'https://huggingface.co/datasets/clue/clue/viewer/c3'
+            xcopa_path = 'https://huggingface.co/datasets/cambridgeltl/xcopa/viewer/zh'
             eval_results = run_benchmark(model, tokenizer, c3_path, xcopa_path)
             if swanlab_run:
                 swanlab_run.log(eval_results, step=global_step)
@@ -116,7 +116,7 @@ if __name__ == "__main__":
     parser.add_argument("--save_interval", type=int, default=1000, help="模型保存间隔")
     parser.add_argument('--hidden_size', default=768, type=int, help="隐藏层维度")
     parser.add_argument('--num_hidden_layers', default=12, type=int, help="隐藏层数量")
-    parser.add_argument('--max_seq_len', default=512, type=int, help="序列长度")
+    parser.add_argument ('--max_seq_len', default=512, type=int, help="序列长度")
     parser.add_argument("--data_path", type=str, default="{你的文件路径}", help="预处理后的.bin文件路径")
     parser.add_argument('--from_weight', default='none', type=str, help="基于哪个权重训练，为none则从头开始")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
@@ -126,3 +126,113 @@ if __name__ == "__main__":
     parser.add_argument("--eval_bench", default=1, type=int, choices=[0, 1], help="是否评测benchmark（0=否，1=是）")
     parser.add_argument("--eval_interval", type=int, default=100, help="评测间隔步数")
     args = parser.parse_args()
+
+# ========== 1. 配置目录、模型参数、检查 ckp ==========
+    lm_config = SpongeBobConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers)
+    run_name = f"h{args.hidden_size}_l{args.num_hidden_layers}_bs{args.batch_size}_lr{args.learning_rate}"
+    full_save_dir = os.path.join(args.save_dir, run_name)
+    os.makedirs(full_save_dir, exist_ok=True)
+
+    ckp_data = None
+    if args.from_resume == 1:
+        ckp_dirs = [d for d in os.listdir(full_save_dir) if d.startswith('global_step_')]
+        if ckp_dirs:
+            latest_ckp = max(ckp_dirs, key=lambda x: int(x.split('_')[-1]))
+            resume_path = f'{full_save_dir}/{latest_ckp}/resume.pth'
+            if os.path.exists(resume_path):
+                ckp_data = torch.load(resume_path, map_location='cpu')
+                Logger(f'Found checkpoint: {full_save_dir}/{latest_ckp}')
+
+    # ========== 3. 混合精度 ==========
+    device_type = "cuda" if "cuda" in args.device else "cpu"
+    dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
+    autocast_ctx = nullcontext() if device_type == "cpu" else torch.amp.autocast(device_type=device_type, dtype=dtype)
+
+    # ========== 4. SwanLab ==========
+    swanlab_run = None
+    if args.use_swanlab:
+        import swanlab
+        swanlab.login(api_key="Nl2NoKA857MhEsVzzudca")
+        swanlab_id = ckp_data.get('swanlab_id') if ckp_data else None
+        swanlab_run = swanlab.init(
+            project=args.swanlab_project,
+            experiment_name=run_name,
+            id=swanlab_id,
+            config=vars(args)
+        )
+        Logger(f'SwanLab initialized: {run_name}')
+
+    # ========== 5. 模型、数据、优化器 ==========
+    # 模型加载/初始化
+    if args.from_weight != 'none' and os.path.exists(args.from_weight):
+        Logger(f'Loading model from {args.from_weight}')
+        model = SpongeBobForCausalLM.from_pretrained(args.from_weight)
+    else:
+        Logger(f'Creating new model: hidden_size={args.hidden_size}, num_layers={args.num_hidden_layers}')
+        model = SpongeBobForCausalLM(lm_config)
+    model = model.to(args.device)
+    Logger(f'Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M')
+    # 评测用tokenizer加载
+    if args.eval_bench == 1:
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained('')
+        Logger('Tokenizer loaded for benchmark evaluation')
+    else:
+        tokenizer = None
+    #pytorch进行加速
+    if args.use_compile == 1:
+        model = torch.compile(model)
+        Logger('torch.compile enabled')
+    Logger('Loading dataset...')
+    # 混合精度scaler + 优化器
+    train_ds = PretrainDataset(args.data_path, seq_len=args.max_seq_len)
+    Logger('Dataset ready')
+    #AdamW = Adam + weigth_decay
+    scaler = torch.amp.GradScaler('cuda', enabled=(args.dtype == 'float16'))
+    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=0.1)
+    Logger('Optimizer ready')
+
+    # ========== 6. 从 ckp 恢复 ==========
+    start_epoch, start_step = 0, 0
+    if ckp_data:
+        Logger('Loading checkpoint...')
+        model.load_state_dict(ckp_data['model'])
+        optimizer.load_state_dict(ckp_data['optimizer'])
+        scaler.load_state_dict(ckp_data['scaler'])
+        start_epoch = ckp_data['epoch']
+        start_step = ckp_data.get('step', 0)
+        Logger(f'Checkpoint loaded: epoch={start_epoch}, step={start_step}')
+
+    # ========== 7. 总步数（单卡）==========
+    steps_per_epoch = len(train_ds) // args.batch_size
+    total_steps = args.epochs * steps_per_epoch
+    warmup_steps = int(total_steps * 0.03)
+    Logger(f'Steps per epoch: {steps_per_epoch}, Total steps: {total_steps}, Warmup: {warmup_steps}')
+
+    # ========== 8. 初始评测 (step 0) ==========
+    if args.eval_bench == 1 and tokenizer is not None and start_epoch == 0 and start_step == 0:
+        Logger('Running initial benchmark evaluation (step 0)...')
+        model.eval()
+        c3_path = ''
+        xcopa_path = ''
+        #返回分数
+        eval_results = run_benchmark(model, tokenizer, c3_path, xcopa_path)
+        if swanlab_run:
+            swanlab_run.log(eval_results, step=0)
+        Logger(f'Initial benchmark results (step 0): {eval_results}')
+        model.train()
+
+    # ========== 9. 训练循环 ==========
+    Logger(f'Starting training: {args.epochs} epochs, batch_size={args.batch_size} (single GPU)')
+    for epoch in range(start_epoch, args.epochs):
+        indices = torch.randperm(len(train_ds)).tolist()
+        skip = start_step if (epoch == start_epoch and start_step > 0) else 0
+        batch_sampler = SkipBatchSampler(indices, args.batch_size, skip)
+        loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
+        if skip > 0:
+            Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
+            train_epoch(epoch, loader, len(loader) + skip, start_step, swanlab_run, total_steps, warmup_steps, full_save_dir)
+        else:
+            train_epoch(epoch, loader, len(loader), 0, swanlab_run, total_steps, warmup_steps, full_save_dir)
+
+    Logger('Training done.')
