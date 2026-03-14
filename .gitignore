@@ -1,0 +1,43 @@
+# 权重与二进制模型文件
+*.pth
+*.bin
+*.meta
+*.tar.gz
+*.safetensors
+
+# 数据集与大数据文件
+thinking_distill.jsonl
+spongebob_sft.jsonl
+benchmark/clue_c3_eval_500.jsonl
+benchmark/xcopa_zh_merged.jsonl
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# 训练输出与日志
+pretrain_out/
+sft_out/
+swanlog/
+swanlog_backup_*/
+nohup.out
+*.log
+._____temp/
+
+# 环境与密钥
+.msc
+.mv
+.env
+.venv/
+venv/
+
+# 重复/备份目录（与根目录重复的 spongebobpro 子目录）
+/spongebobpro/
+

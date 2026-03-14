@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -124,7 +125,7 @@ class Attention(nn.Module):
         # Dropout
         self.dropout = nn.Dropout(args.dropout)
         self.resid_dropout = nn.Dropout(args.dropout)
-        self.dropout = args.dropout
+        self.dropout_p = float(args.dropout)
 
         # Flash Attention 支持检测
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and args.flash_attn
@@ -182,7 +183,7 @@ class Attention(nn.Module):
                 # 无 padding，使用 is_causal=True（最快路径）
                 output = F.scaled_dot_product_attention(
                     xq, xk, xv,
-                    dropout_p=self.dropout if self.training else 0.0,
+                    dropout_p=self.dropout_p if self.training else 0.0,
                     is_causal=True
                 )
             else:
@@ -204,7 +205,7 @@ class Attention(nn.Module):
                 output = F.scaled_dot_product_attention(
                     xq, xk, xv,
                     attn_mask=combined_mask,
-                    dropout_p=self.dropout if self.training else 0.0
+                    dropout_p=self.dropout_p if self.training else 0.0,
                 )
         else:
             # 传统 Attention 实现（用于推理时的 KV cache 或 PyTorch < 2.0）
@@ -220,7 +221,7 @@ class Attention(nn.Module):
                 scores = scores + extended_attention_mask
 
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-            scores = self.attn_dropout(scores)
+            scores = self.dropout(scores)
             output = scores @ xv
 
         # 恢复形状并输出投影
@@ -260,44 +261,45 @@ class SpongeBobBlock(nn.Module):
         self.head_dim = config.hidden_size // config.num_attention_heads
         self.self_attn = Attention(config)
 
-        self.layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = FeedForward(config)  
 
     def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
         """
         前向传播：Pre-Norm Transformer Block
         结构：
-            x = x + Attention(Norm(x))
-            x = x + MLP(Norm(x))
+            x = x + Attention(input_layernorm(x))
+            x = x + MLP(post_attention_layernorm(x))
         """
         # Self-Attention with residual connection
         residual = hidden_states
         hidden_states, present_key_value = self.self_attn(
-            self.layernorm(hidden_states), position_embeddings,
+            self.input_layernorm(hidden_states), position_embeddings,
             past_key_value, use_cache, attention_mask
         )
         hidden_states += residual
         
         # FeedForward with residual connection
-        hidden_states = hidden_states + self.mlp(self.layernorm(hidden_states)) 
+        hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states)) 
         return hidden_states, present_key_value
         
 class SpongeBobModel(nn.Module):
-        """
-        SpongeBob 模型主体（Decoder-only Transformer）
-        """ 
+    """
+    SpongeBob 模型主体（Decoder-only Transformer）
+    """
 
-        def __init__(self, config: SpongeBobConfig):
+    def __init__(self, config: SpongeBobConfig):
         super().__init__()
-        self.num_hidden_layers =config.num_hidden_layers
+        self.num_hidden_layers = config.num_hidden_layers
 
         # Token Embedding
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.dropout = nn.Dropout(config.dropout)
-        
+
         # Transformer Blocks
-        self.layers = nn.ModuleList([SpongeBobBlock(config) for l in range(self.num_hidden_layers)])
-        
+        self.layers = nn.ModuleList([SpongeBobBlock(config) for _ in range(self.num_hidden_layers)])
+
         # 最终的 LayerNorm
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -305,37 +307,39 @@ class SpongeBobModel(nn.Module):
         freqs_cos, freqs_sin = precompute_freqs_cis(
             dim=config.hidden_size // config.num_attention_heads,
             end=config.max_position_embeddings,
-            rope_base=config.rope_theta
+            rope_base=config.rope_theta,
         )
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)
 
-        def forward(self,
-                input_ids: Optional[torch.Tensor] = None,
-                attention_mask: Optional[torch.Tensor] = None,
-                past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
-                use_cache: bool = False,
-                **kwargs):
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        use_cache: bool = False,
+        **kwargs,
+    ):
         """
         前向传播
-        
+
         Args:
             input_ids: 输入 token IDs (batch, seq_len)
             attention_mask: 注意力掩码 (batch, seq_len)，1=有效位置，0=padding
             past_key_values: KV cache 列表，用于推理加速
             use_cache: 是否返回新的 KV cache
-        
+
         Returns:
             hidden_states: 最后一层的隐藏状态 (batch, seq_len, hidden_size)
-            presents: 新的 KV ·cache 列表
+            presents: 新的 KV cache 列表
         """
         batch_size, seq_length = input_ids.shape
 
         # 处理 past_key_values
-        if hasattr(past_key_values, 'layers'): 
+        if hasattr(past_key_values, "layers"):
             past_key_values = None
         past_key_values = past_key_values or [None] * len(self.layers)
-        
+
         # 计算起始位置（用于 RoPE）
         start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
 
@@ -344,19 +348,19 @@ class SpongeBobModel(nn.Module):
 
         # 获取当前序列的位置编码（从 start_pos 开始）
         position_embeddings = (
-            self.freqs_cos[start_pos:start_pos + seq_length],
-            self.freqs_sin[start_pos:start_pos + seq_length]
+            self.freqs_cos[start_pos : start_pos + seq_length],
+            self.freqs_sin[start_pos : start_pos + seq_length],
         )
 
         # 逐层前向传播
         present_key_values = []
-        for layer, past_key_value in enumerate(zip(self.layers, past_key_values)):
+        for layer, past_key_value in zip(self.layers, past_key_values):
             hidden_states, present = layer(
                 hidden_states,
                 position_embeddings,
                 past_key_value=past_key_value,
                 use_cache=use_cache,
-                attention_mask=attention_mask
+                attention_mask=attention_mask,
             )
             present_key_values.append(present)
 

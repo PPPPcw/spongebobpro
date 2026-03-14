@@ -91,8 +91,8 @@ def train_epoch(epoch, loader, iters, start_step=0, swanlab=None, total_steps=No
         # 7.Benchmark 评测 评测效果：验证模型性能
         if args.eval_bench == 1 and tokenizer is not None and global_step % args.eval_interval == 0:
             model.eval()
-            c3_path = 'D:\spongebobpro\benchmark\clue_c3_eval_500.jsonl'
-            xcopa_path = 'D:\spongebobpro\benchmark\xcopa_zh_merged.jsonl'
+            c3_path = '/root/autodl-tmp/spongebobpro/benchmark/clue_c3_eval_500.jsonl'
+            xcopa_path = '/root/autodl-tmp/spongebobpro/benchmark/xcopa_zh_merged.jsonl'
             eval_results = run_benchmark(model, tokenizer, c3_path, xcopa_path)
             if swanlab_run:
                 swanlab_run.log(eval_results, step=global_step)
@@ -102,7 +102,7 @@ def train_epoch(epoch, loader, iters, start_step=0, swanlab=None, total_steps=No
         del input_ids, labels, res, loss   
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SpongeBob Pretraining (Single GPU)")
-    parser.add_argument("--save_dir", type=str, default="../pretrain_out", help="模型保存根目录")
+    parser.add_argument("--save_dir", type=str, default="../pretrain_out/exp_1", help="模型保存根目录")
     parser.add_argument('--save_weight', default='pretrain', type=str, help="保存权重的前缀名")
     parser.add_argument("--epochs", type=int, default=2, help="训练轮数")
     parser.add_argument("--batch_size", type=int, default=128, help="batch size")
@@ -112,12 +112,12 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int, default=8, help="数据加载线程数")
     parser.add_argument("--accumulation_steps", type=int, default=1, help="梯度累积步数")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
-    parser.add_argument("--log_interval", type=int, default=10, help="日志打印间隔")
+    parser.add_argument("--log_interval", type=int, default=100, help="日志打印间隔")
     parser.add_argument("--save_interval", type=int, default=1000, help="模型保存间隔")
     parser.add_argument('--hidden_size', default=768, type=int, help="隐藏层维度")
     parser.add_argument('--num_hidden_layers', default=12, type=int, help="隐藏层数量")
     parser.add_argument ('--max_seq_len', default=512, type=int, help="序列长度")
-    parser.add_argument("--data_path", type=str, default="{你的文件路径}", help="预处理后的.bin文件路径")
+    parser.add_argument("--data_path", type=str, default="{/root/autodl-tmp/spongebobpro/SpongeBobPRO_pretrain_512_final.bin}", help="预处理后的.bin文件路径")
     parser.add_argument('--from_weight', default='none', type=str, help="基于哪个权重训练，为none则从头开始")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
     parser.add_argument("--use_swanlab", type=int, default=1, choices=[0, 1], help="是否使用swanlab（0=否，1=是）")
@@ -154,19 +154,33 @@ if __name__ == "__main__":
         import swanlab
         swanlab.login(api_key="Nl2NoKA857MhEsVzzudca")
         swanlab_id = ckp_data.get('swanlab_id') if ckp_data else None
-        swanlab_run = swanlab.init(
-            project=args.swanlab_project,
-            experiment_name=run_name,
-            id=swanlab_id,
-            config=vars(args)
-        )
+        # 如果有历史 swanlab_id，表示从断点恢复，需要开启 resume；
+        # 否则开启一个全新的实验，不传 id。
+        if swanlab_id:
+            swanlab_run = swanlab.init(
+                project=args.swanlab_project,
+                experiment_name=run_name,
+                id=swanlab_id,
+                resume=True,
+                config=vars(args)
+            )
+        else:
+            swanlab_run = swanlab.init(
+                project=args.swanlab_project,
+                experiment_name=run_name,
+                config=vars(args)
+            )
         Logger(f'SwanLab initialized: {run_name}')
 
     # ========== 5. 模型、数据、优化器 ==========
     # 模型加载/初始化
     if args.from_weight != 'none' and os.path.exists(args.from_weight):
         Logger(f'Loading model from {args.from_weight}')
-        model = SpongeBobForCausalLM.from_pretrained(args.from_weight)
+        # 我们保存的是纯 state_dict(.pth)，不是 HuggingFace 目录结构，
+        # 这里先用配置初始化模型，再用 torch.load 加载权重。
+        model = SpongeBobForCausalLM(lm_config)
+        state_dict = torch.load(args.from_weight, map_location='cpu')
+        model.load_state_dict(state_dict, strict=True)
     else:
         Logger(f'Creating new model: hidden_size={args.hidden_size}, num_layers={args.num_hidden_layers}')
         model = SpongeBobForCausalLM(lm_config)
@@ -175,7 +189,8 @@ if __name__ == "__main__":
     # 评测用tokenizer加载
     if args.eval_bench == 1:
         from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained('')
+        # tokenizer 文件实际在子目录 tokenizer_15k/tokenizer_15k 下
+        tokenizer = AutoTokenizer.from_pretrained('/root/autodl-tmp/spongebobpro/tokenizer_15k/tokenizer_15k', use_fast=False)
         Logger('Tokenizer loaded for benchmark evaluation')
     else:
         tokenizer = None
@@ -196,7 +211,10 @@ if __name__ == "__main__":
     start_epoch, start_step = 0, 0
     if ckp_data:
         Logger('Loading checkpoint...')
-        model.load_state_dict(ckp_data['model'])
+        # 训练时可能使用 torch.compile 包裹过模型，
+        # 这里需要把权重加载到未编译的原始模型上。
+        raw_model = getattr(model, '_orig_mod', model)
+        raw_model.load_state_dict(ckp_data['model'])
         optimizer.load_state_dict(ckp_data['optimizer'])
         scaler.load_state_dict(ckp_data['scaler'])
         start_epoch = ckp_data['epoch']
@@ -213,8 +231,8 @@ if __name__ == "__main__":
     if args.eval_bench == 1 and tokenizer is not None and start_epoch == 0 and start_step == 0:
         Logger('Running initial benchmark evaluation (step 0)...')
         model.eval()
-        c3_path = 'D:\spongebobpro\benchmark\clue_c3_eval_500.jsonl'
-        xcopa_path = 'D:\spongebobpro\benchmark\xcopa_zh_merged.jsonl'
+        c3_path = '/root/autodl-tmp/spongebobpro/benchmark/clue_c3_eval_500.jsonl'
+        xcopa_path = '/root/autodl-tmp/spongebobpro/benchmark/xcopa_zh_merged.jsonl'
         #返回分数
         eval_results = run_benchmark(model, tokenizer, c3_path, xcopa_path)
         if swanlab_run:
